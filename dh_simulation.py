@@ -1,144 +1,189 @@
 import hashlib
+import secrets
 import os
 
-# --- Class Implementations ---
+# --- UI HELPER FUNCTIONS ---
+def print_header(text):
+    print(f"\n{'='*60}\n{text}\n{'='*60}")
 
+def print_step(text):
+    print(f"\n>> {text}")
+
+def print_info(label, value):
+    print(f" [{label}]: {str(value)[:70]}...")
+
+# --- Define Diffie-Hellman Constants G and P ---
+P = int("FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
+        "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
+        "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
+        "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
+        "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D"
+        "C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F"
+        "83655D23DCA3AD961C62F356208552BB9ED529077096966D"
+        "670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B"
+        "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9"
+        "DE2BCBF6955817183995497CEA956AE515D2261898FA0510"
+        "15728E5A8AACAA68FFFFFFFFFFFFFFFF", 16)
+G = 2
+
+# --- PART A: STATEFUL PRNG ---
 class SecurePRNG:
-    """Stateful PRNG with Rollback Resistance."""
-    def __init__(self, shared_secret):
-        # Initialize state with shared secret (hashed to 32 bytes)
-        self.state = hashlib.sha256(str(shared_secret).encode()).digest()
+    def __init__(self, seed_int):
+        # Initialize the state with the shared secret (hashed to 32 bytes)
+        self.state = hashlib.sha256(str(seed_int).encode()).digest()
 
-    def generate(self, n):
-        """Produces n pseudorandom bytes and updates state."""
-        keystream = b""
-        for _ in range(n // 32 + 1):
-            # Generate bytes from current state
-            keystream += hashlib.sha256(self.state).digest()
-            # Update state for Rollback Resistance: State = H(State + Keystream)
-            self.state = hashlib.sha256(self.state + keystream).digest()
-        return keystream[:n]
+    def generate(self, n_bytes):
+        # Generates n bytes while ensuring Rollback Resistance.
+        output = b""
+        while len(output) < n_bytes:
+            # 1. Produce keystream block from current state
+            block = hashlib.sha256(self.state).digest()
+            output += block
+            # 2. Update state immediately (One-way progression)
+            # This prevents an attacker from reversing the state if they find it later.
+            self.state = hashlib.sha256(block + self.state).digest()
+        return output[:n_bytes]
 
-def stream_cipher(plaintext, prng):
-    """XOR Cipher using PRNG keystream."""
-    if isinstance(plaintext, str):
-        plaintext = plaintext.encode()
-    
-    keystream = prng.generate(len(plaintext))
-    
-    # XOR operation
-    ciphertext = bytes([p ^ k for p, k in zip(plaintext, keystream)])
-    return ciphertext
+def xor_crypt(data, prng):
+    # Standard XOR stream cipher logic
+    if isinstance(data, str):
+        data = data.encode()
+    keystream = prng.generate(len(data))
+    return bytes([b ^ k for b, k in zip(data, keystream)])
 
+# --- PART B: COMMUNICATION PROTOCOL ---
 class Entity:
-    """Alice or Bob."""
-    def __init__(self, name, p, g):
+    def __init__(self, name):
         self.name = name
-        self.p = p
-        self.g = g
-        self.private_key = int.from_bytes(os.urandom(16), 'big') % p
-        self.public_key = pow(g, self.private_key, p)
-        self.shared_secret = None
-        self.prng = None
+        # Generate a secure random private key
+        self.private_key = secrets.randbelow(P)
+        self.public_key = pow(G, self.private_key, P)
+        self.session_prng = None
 
     def get_public_hex(self):
         return hex(self.public_key)
 
-    def establish_session(self, other_public_hex):
-        other_public = int(other_public_hex, 16)
-        self.shared_secret = pow(other_public, self.private_key, self.p)
-        self.prng = SecurePRNG(self.shared_secret)
-        return self.shared_secret
+    def establish_session(self, partner_pub_hex):
+        partner_pub = int(partner_pub_hex, 16)
+        shared_secret = pow(partner_pub, self.private_key, P)
+        self.session_prng = SecurePRNG(shared_secret)
 
+class Network:
+    def __init__(self):
+        self.mallory = None 
+    def send(self, sender, recipient, payload):
+        print(f"[NET] {sender} -> {recipient}: {str(payload)[:60]}...")
+        if self.mallory:
+            return self.mallory.intercept(sender, recipient, payload)
+        return payload
+
+# --- PART C: THE MALLORY MITM PROXY ---
 class Mallory:
-    """Interceptor (MITM)."""
-    def __init__(self, p, g):
-        self.p = p
-        self.g = g
-        self.private_key = int.from_bytes(os.urandom(16), 'big') % p
-        self.public_key = pow(g, self.private_key, p)
-        self.secrets = {} # Stores secrets with Alice and Bob
+    def __init__(self):
+        self.private_key = secrets.randbelow(P)
+        self.public_key = pow(G, self.private_key, P)
+        self.public_hex = hex(self.public_key)
+        # Mallory maintains TWO sessions
+        self.alice_prng = None
+        self.bob_prng = None
 
-    def get_public_hex(self):
-        return hex(self.public_key)
+    def intercept(self, sender, recipient, payload):
+        # 1. Logic for Key Exchange Interception
+        if isinstance(payload, str) and payload.startswith("0x"):
+            remote_pub = int(payload, 16)
+            my_shared_secret = pow(remote_pub, self.private_key, P)
+            
+            if sender == "Alice":
+                self.alice_prng = SecurePRNG(my_shared_secret)
+            elif sender == "Bob":
+                self.bob_prng = SecurePRNG(my_shared_secret)
+            
+            return self.public_hex 
 
-    def intercept_key(self, sender_name, public_hex):
-        """Intercepts key, establishes fake secret with sender."""
-        public_key = int(public_hex, 16)
-        # S = OtherPubKey^MalloryPrivKey % p
-        self.secrets[sender_name] = pow(public_key, self.private_key, self.p)
-        return hex(self.public_key)
-
-    def intercept_message(self, encrypted_msg, sender_name, recipient_name):
-        """Decrypts, modifies, and re-encrypts."""
-        # 1. Decrypt using sender's secret
-        prng_sender = SecurePRNG(self.secrets[sender_name])
-        decrypted = stream_cipher(encrypted_msg, prng_sender).decode()
+        # 2. Logic for Message Interception/Modification
+        if isinstance(payload, bytes):
+            print(f"[MALLORY] Intercepting Encrypted Message from {sender}...")
+            
+            # Decrypt message from Alice
+            plaintext = xor_crypt(payload, self.alice_prng).decode()
+            print(f"[MALLORY] Decrypted Plaintext: '{plaintext}'")
+            
+            # Modify the message: Change '9pm' to '3am'
+            modified_text = plaintext.replace("9pm", "3am")
+            print(f"[MALLORY] Modified Message: '{modified_text}'")
+            
+            # Re-encrypt for Bob
+            return xor_crypt(modified_text, self.bob_prng)
         
-        print(f"[ATTACK] Mallory intercepted: {decrypted}")
-        
-        # 2. Modify message
-        modified = decrypted.replace("10am", "12pm")
-        print(f"[ATTACK] Mallory modified to: {modified}")
-        
-        # 3. Re-encrypt using recipient's secret
-        prng_recipient = SecurePRNG(self.secrets[recipient_name])
-        return stream_cipher(modified, prng_recipient)
+        return payload
 
-# --- Main Simulation ---
-
+# --- MAIN EXECUTION SIMULATION ---
 def main():
-    # Parameters derived from context
-    p = 23
-    g = 5
-    
-    alice = Entity("Alice", p, g)
-    bob = Entity("Bob", p, g)
-    mallory = Mallory(p, g)
+    # ==========================================
+    # SCENARIO A: BENIGN (SECURE) COMMUNICATION
+    # ==========================================
+    print_header("SCENARIO A: BENIGN (SECURE) COMMUNICATION")
+    alice = Entity("Alice")
+    bob = Entity("Bob")
+    net = Network()
 
-    print("--- Scenario A: Benign Communication ---")
-    
-    # Exchange Keys
-    a_pub = alice.get_public_hex()
-    b_pub = bob.get_public_hex()
-    
-    alice.establish_session(b_pub)
-    bob.establish_session(a_pub)
-    
-    # Alice sends message
-    message = "We are meeting at 10am tomorrow."
-    encrypted = stream_cipher(message, alice.prng)
-    
-    # Bob decrypts
-    decrypted = stream_cipher(encrypted, bob.prng).decode()
-    
-    print(f"Original: {message}")
-    print(f"Decrypted: {decrypted}")
-    if message == decrypted:
-        print("[SUCCESS] Secrets Match!")
+    print_step("Step 0: Global Group Parameters")
+    print_info("G (Generator)", G)
+    print_info("P (Prime)", P)
 
-    print("\n--- Scenario B: MITM Attack ---")
+    print_step("Step 1: Public Key Exchange")
+    alice_pub = alice.get_public_hex()
+    key_for_bob = net.send("Alice", "Bob", alice_pub)
+    bob_pub = bob.get_public_hex()
+    key_for_alice = net.send("Bob", "Alice", bob_pub)
+
+    print_step("Step 2: Establishing Sessions")
+    alice.establish_session(key_for_alice)
+    bob.establish_session(key_for_bob)
+    print(" [Status]: Shared Secret computed.")
+
+    print_step("Step 3: Secure Message Transmission")
+    # --- MODIFY THIS MESSAGE FOR YOUR ASSIGNMENT ---
+    message = b"The secret meeting is at 9pm." 
+    # -----------------------------------------------
+    encrypted_msg = xor_crypt(message, alice.session_prng)
+    delivered_data = net.send("Alice", "Bob", encrypted_msg)
+    final_message = xor_crypt(delivered_data, bob.session_prng)
+    print_info("Bob decrypted", final_message.decode())
+
+    # ==========================================
+    # SCENARIO B: MALICIOUS (MITM) ATTACK
+    # ==========================================
+    print_header("SCENARIO B: MALICIOUS (MITM) ATTACK")
+    alice = Entity("Alice")
+    bob = Entity("Bob")
+    mallory = Mallory()
+    net = Network()
+    net.mallory = mallory
+
+    print_step("Step 1: Mallory's Parameters")
+    print_info("Mallory Private (m)", mallory.private_key)
+    print_info("Mallory Public (M)", mallory.public_hex)
+
+    print_step("Step 2: Compromised Key Exchange")
+    key_for_bob = net.send("Alice", "Bob", alice.get_public_hex())
+    key_for_alice = net.send("Bob", "Alice", bob.get_public_hex())
+
+    print_step("Step 3: Poisoned Shared Secrets")
+    alice.establish_session(key_for_alice)
+    bob.establish_session(key_for_bob)
+
+    print_step("Step 4: Interception")
+    # Alice sends her message
+    encrypted_msg = xor_crypt(message, alice.session_prng)
+    delivered_data = net.send("Alice", "Bob", encrypted_msg)
     
-    # Mallory Intercepts Keys
-    m_pub_for_alice = mallory.intercept_key("Alice", a_pub)
-    m_pub_for_bob = mallory.intercept_key("Bob", b_pub)
-    
-    # Alice and Bob establish sessions with Mallory
-    alice.establish_session(m_pub_for_alice)
-    bob.establish_session(m_pub_for_bob)
-    
-    # Alice sends message
-    encrypted_for_bob = stream_cipher(message, alice.prng)
-    
-    # Mallory Intercepts Message
-    tampered_msg = mallory.intercept_message(encrypted_for_bob, "Alice", "Bob")
-    
-    # Bob decrypts tampered message
-    decrypted_by_bob = stream_cipher(tampered_msg, bob.prng).decode()
-    
-    print(f"Bob received: {decrypted_by_bob}")
-    if decrypted_by_bob != message:
-        print("[ATTACK] ATTACK SUCCESS: Bob received modified message.")
+    # Bob decrypts what he received from the network
+    final_message = xor_crypt(delivered_data, bob.session_prng)
+    print_info("Bob received", final_message.decode())
+
+    if b"3am" in final_message:
+        print("\n[DANGER] MITM SUCCESS: Mallory modified the message in transit.")
 
 if __name__ == "__main__":
     main()
